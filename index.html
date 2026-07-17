@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Ryan Shirley — World Travel Map</title>
+  <link rel="preconnect" href="https://basemaps.cartocdn.com" />
+  <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet" />
+  <link href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" rel="stylesheet" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <link href="style.css?v=18" rel="stylesheet" />
+</head>
+<body>
+  <div id="map"></div>
+
+  <header id="topbar">
+    <div class="tb-l">
+      <div class="brand"><span class="dot"></span> Ryan Shirley <span class="brand-sub">· World Travel Map</span></div>
+      <div id="stats" class="stats"></div>
+    </div>
+    <div class="tb-r">
+      <input id="search" type="search" placeholder="Search a place or country…" autocomplete="off" />
+      <button id="hub-btn" class="hub-btn" title="Your other maps">◆ Maps</button>
+    </div>
+  </header>
+
+  <div id="filters" class="filters"></div>
+
+  <aside id="rank" class="rank"></aside>
+
+  <div id="hub" class="hub" hidden>
+    <div class="hub-head">Your travel maps</div>
+    <a href="http://localhost:8017" target="_blank">🇦🇷 Argentina trip planner</a>
+    <a href="http://localhost:8016" target="_blank">🌍 World solo-travel atlas</a>
+    <a href="http://localhost:8015" target="_blank">🌏 Eurasia solo atlas</a>
+    <a href="http://localhost:8013" target="_blank">🌎 South America solo atlas</a>
+    <div class="hub-note">Open the matching preview server to view each.</div>
+  </div>
+
+  <div id="results" class="results" hidden></div>
+  <aside id="panel" class="panel" hidden></aside>
+
+  <div id="loading" class="boot">Loading Ryan Shirley’s world…</div>
+  <script src="app.js?v=18"></script>
+</body>
+</html>

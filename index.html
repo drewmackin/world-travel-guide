@@ -4,12 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Ryan Shirley — World Travel Map</title>
-  <link rel="preconnect" href="https://basemaps.cartocdn.com" />
+  <link rel="preconnect" href="https://server.arcgisonline.com" />
   <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet" />
   <link href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" rel="stylesheet" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-  <link href="style.css?v=18" rel="stylesheet" />
+  <link href="style.css?v=26" rel="stylesheet" />
 </head>
 <body>
   <div id="map"></div>
@@ -20,7 +20,8 @@
       <div id="stats" class="stats"></div>
     </div>
     <div class="tb-r">
-      <input id="search" type="search" placeholder="Search a place or country…" autocomplete="off" />
+      <input id="search" type="search" placeholder="Search place, country, region…" autocomplete="off" />
+      <button id="filt-toggle" class="filt-toggle" title="Show filters">⚙ Filters<span id="filt-count" class="filt-badge" hidden></span></button>
       <button id="hub-btn" class="hub-btn" title="Your other maps">◆ Maps</button>
     </div>
   </header>
@@ -42,6 +43,6 @@
   <aside id="panel" class="panel" hidden></aside>
 
   <div id="loading" class="boot">Loading Ryan Shirley’s world…</div>
-  <script src="app.js?v=18"></script>
+  <script src="app.js?v=26"></script>
 </body>
 </html>

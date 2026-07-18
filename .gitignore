@@ -25,3 +25,9 @@ data/insights.json
 
 # extra intermediate
 data/*args*.json
+
+# curation tags (raw agent output) + full-set backup (regenerable by build/build.py)
+data/curate/
+data/app.full.json
+# gathered photo pool (regenerable by build/photos.py; already merged into data/app.json)
+data/photos_extra.json

@@ -1,13 +1,23 @@
 'use strict';
-/* Ryan Shirley — World Travel Map. Buildless MapLibre + native clustering (scales to 1000s of pins).
+/* World travel guide. Buildless Leaflet + markercluster, scales to 1,500+ pins.
    Data: data/app.json {meta, places[], videos[]}. Weather: Open-Meteo (on demand). No API keys. */
-let DATA=null, MAP=null, PLACES=[], BYID={}, FILT={cont:'all'}, LB=null;
+/* Faceted filter state. loc = Set of location facets — 'z:<collection>' | 'k:<continent>' | 'c:<country>'.
+   Location facets OR within themselves; they AND across the safety/price/text facets.
+   Everything maps to real data fields — no fabrication. */
+let DATA=null, MAP=null, PLACES=[], BYID={}, FILT={q:'',loc:new Set(),safety:'all',price:4,famous:false}, LB=null;
 const esc=s=>(s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const CONTS=[['all','All','#eef2f7'],['Europe','Europe','var(--eu)'],['Asia','Asia','var(--as)'],
-  ['Africa','Africa','var(--af)'],['North America','N. America','var(--na)'],
-  ['South America','S. America','var(--sa)'],['Oceania','Oceania','var(--oc)']];
-const CC={'Europe':'#5aa0ff','Asia':'#e8794a','Africa':'#e5c04a','North America':'#9b6cf0',
+/* Hand-curated collections that sit on top of the world map */
+const ZONEDOT={med:'#2bb4d6',sa:'#f08a46',fr:'#b58cf0'};
+const ZONELAB={med:'Mediterranean coast',sa:'Exotic & safe S. America',fr:'Charming France'};
+const ZONEBOX={med:[[30,-6],[46,36]],sa:[[-56,-82],[6,-34]],fr:[[42.2,-4.8],[51.1,8.3]]};
+/* Whole-world geography */
+const CONTS=['Europe','Asia','Africa','North America','South America','Oceania'];
+const CONTCOL={'Europe':'#5aa0ff','Asia':'#e8794a','Africa':'#e5c04a','North America':'#9b6cf0',
   'South America':'#5bd6c0','Oceania':'#f05a8c','Other':'#8492a3'};
+const CONTBOX={'Europe':[[34,-11],[60,30]],'Asia':[[5,40],[55,145]],'Africa':[[-35,-18],[38,52]],
+  'North America':[[10,-125],[50,-66]],'South America':[[-55,-82],[12,-34]],'Oceania':[[-48,110],[-8,180]]};
+const WORLDVIEW={center:[25,8],zoom:2};
+const markerCol=p=>CONTCOL[p.continent]||CONTCOL.Other;
 
 /* booking + map links (deterministic, real, bookable — no fabrication) */
 const q=s=>encodeURIComponent(s);
@@ -26,6 +36,26 @@ const ADV={1:['#5cc98a','Exercise normal precautions'],2:['#e5c04a','Exercise in
 const advColor=l=>(ADV[l]||['#8492a3',''])[0];
 const usd=n=>(n||n===0)?'$'+Number(n).toLocaleString():'—';
 const costTierHTML=t=>{t=t||0;let s='';for(let i=1;i<=4;i++)s+=`<span class="${i<=t?'ct-on':'ct-off'}">$</span>`;return s;};
+/* richer per-country cost breakdown + safety detail (real typical figures, tagged confidence) */
+function costDetailHTML(cd){
+  if(!cd) return '';
+  const row=(ic,lab,v)=>(v||v===0)?`<div class="cd-row"><span class="cd-ic">${ic}</span><span class="cd-lab">${esc(lab)}</span><span class="cd-v">${usd(v)}</span></div>`:'';
+  const items=[row('🍽','Cheap local meal',cd.mealInexpensive),row('🍷','Dinner for two',cd.mealMidTwo),
+    row('🍺','Local beer',cd.beer),row('☕','Coffee',cd.coffee),row('💧','Water 1.5L',cd.water),
+    row('🚌','Local transit',cd.localTransit),row('🚕','Taxi start',cd.taxiStart),row('📶','Tourist SIM',cd.simData)].join('');
+  if(!items) return '';
+  return `<div class="cd-grid">${items}</div>
+    <div class="src-note">Typical everyday prices${cd.confidence?` · confidence ${esc(cd.confidence)}`:''}</div>`;
+}
+function safetyDetailHTML(sd){
+  if(!sd) return '';
+  const tips=(sd.tips||[]).map(t=>`<li>${esc(t)}</li>`).join('');
+  const chips=[sd.emergency?`<span class="sd-chip">🚨 Emergency ${esc(sd.emergency)}</span>`:'',
+    sd.tapWater?`<span class="sd-chip">🚰 Tap water: ${esc(sd.tapWater)}</span>`:''].filter(Boolean).join('');
+  return `${tips?`<div class="sd-lab">Good to know</div><ul class="sd-tips">${tips}</ul>`:''}
+    ${chips?`<div class="sd-meta">${chips}</div>`:''}
+    ${sd.soloFemale?`<div class="sd-solo">👤 <b>Solo:</b> ${esc(sd.soloFemale)}</div>`:''}`;
+}
 
 /* weather */
 const WX={0:['☀️','Clear'],1:['🌤️','Mostly clear'],2:['⛅','Partly cloudy'],3:['☁️','Overcast'],
@@ -47,7 +77,8 @@ async function boot(){
     DATA=await fetch('data/app.json?_='+Date.now()).then(r=>r.json());
     PLACES=DATA.places; PLACES.forEach(p=>BYID[p.id]=p);
     document.title=DATA.meta.title;
-    renderStats(); renderFilters(); initMap(); wireUI();
+    renderStats(); renderFilters(); initMap(); wireUI(); syncFacetUI(); layoutRank();
+    window.addEventListener('resize',()=>{layoutRank(); if(MAP) MAP.invalidateSize();});
     document.getElementById('loading').classList.add('gone');
   }catch(e){
     document.getElementById('loading').textContent='Could not load map data — run the build pipeline first. ('+e+')';
@@ -60,17 +91,160 @@ function renderStats(){
     [['videos','videos'],['pinned','places mapped'],['countries','countries']]
     .map(([k,l])=>`<div class="st"><b>${(m[k]||0).toLocaleString()}</b><small>${l}</small></div>`).join('');
 }
+/* ---------- FACETED FILTERS (search + stackable, real-data-only) ---------- */
+function countriesByContinent(){
+  const m={};
+  PLACES.forEach(p=>{ if(!p.country) return;
+    const k=p.continent||'Other'; (m[k]=m[k]||new Set()).add(p.country); });
+  const order=CONTS.concat(['Other']);
+  const out=[];
+  order.forEach(k=>{ if(m[k]) out.push([k,[...m[k]].sort()]); });
+  return out;
+}
+/* A place passes only if it satisfies text AND (any selected location) AND safety AND price. */
+function matches(p){
+  if(!p.pinned) return false;
+  if(p.icon && !FILT.famous && !FILT.q) return false;            // famous spots hidden by default, but findable by name
+  if(FILT.q){
+    const hay=(p.name+' '+(p.country||'')+' '+(p.region||'')+' '+(p.continent||'')+' '+(ZONELAB[p.zone]||'')+' '+(p.curTag||'')).toLowerCase();
+    if(!hay.includes(FILT.q)) return false;
+  }
+  if(FILT.loc.size){
+    let ok=false;
+    for(const f of FILT.loc){
+      const kind=f.slice(0,2), val=f.slice(2);
+      if(kind==='z:'&&p.zone===val){ok=true;break;}          // curated collection
+      if(kind==='k:'&&p.continent===val){ok=true;break;}     // continent
+      if(kind==='c:'&&p.country===val){ok=true;break;}       // country
+    }
+    if(!ok) return false;
+  }
+  const lvl=(p.advisory&&p.advisory.level)||9;
+  if(FILT.safety==='safe'&&lvl>2) return false;
+  if(FILT.safety==='very'&&lvl>1) return false;
+  if(FILT.price<4&&(p.costTier||9)>FILT.price) return false;
+  return true;
+}
 function renderFilters(){
-  document.getElementById('filters').innerHTML=CONTS.map(([k,l,c])=>
-    `<button data-cont="${k}" class="${k==='all'?'on':''}">${k!=='all'?`<span class="cdot" style="background:${c}"></span>`:''}${l}</button>`).join('');
-  document.querySelectorAll('#filters button').forEach(b=>b.onclick=()=>setCont(b.dataset.cont));
+  const host=document.getElementById('filters'); if(!host) return;
+  const groups=countriesByContinent();
+  const ctyList=groups.map(([k,list])=>
+    `<div class="fdd-sec" data-sec="${esc(k)}">${esc(k)}</div>`+
+    list.map(c=>`<label class="fcc" data-name="${esc(c.toLowerCase())}"><input type="checkbox" data-country="${esc(c)}"><span>${esc(c)}</span></label>`).join('')
+  ).join('');
+  host.innerHTML=`
+   <div class="fb-scroll">
+    <div class="fgrp loc">
+      <span class="fglab">✦ Collections</span>
+      <button class="fchip" data-zone="med"><span class="fc-dot" style="background:${ZONEDOT.med}"></span>Mediterranean coast</button>
+      <button class="fchip" data-zone="fr"><span class="fc-dot" style="background:${ZONEDOT.fr}"></span>Charming France</button>
+      <button class="fchip" data-zone="sa"><span class="fc-dot" style="background:${ZONEDOT.sa}"></span>Exotic &amp; safe S. America</button>
+    </div>
+    <div class="fgrp loc">
+      <span class="fglab">🌍 Continent</span>
+      ${CONTS.map(k=>`<button class="fchip" data-cont="${esc(k)}"><span class="fc-dot" style="background:${CONTCOL[k]}"></span>${esc(k==='North America'?'N. America':k==='South America'?'S. America':k)}</button>`).join('')}
+      <span id="cty-chips" class="cty-chips"></span>
+      <div class="fdd">
+        <button class="fchip fdd-btn" id="cty-btn">＋ Country <span class="caret">▾</span></button>
+        <div class="fdd-menu" id="cty-menu" hidden>
+          <input id="cty-search" class="fdd-search" type="search" placeholder="Filter countries…" autocomplete="off" />
+          <div id="cty-list">${ctyList}</div>
+        </div>
+      </div>
+    </div>
+    <div class="fgrp"><span class="fglab">🛡 Safety</span>
+      <div class="seg" id="seg-safe">
+        <button data-safe="all" class="on">Any</button>
+        <button data-safe="safe" title="US State Dept advisory level 1–2">Safe</button>
+        <button data-safe="very" title="US State Dept advisory level 1 only">Safest</button>
+      </div></div>
+    <div class="fgrp"><span class="fglab">💰 Price</span>
+      <div class="seg" id="seg-price">
+        <button data-price="4" class="on">Any</button>
+        <button data-price="1" title="cheapest">$</button>
+        <button data-price="2">$$</button>
+        <button data-price="3">$$$</button>
+      </div></div>
+    <label class="ftog"><input type="checkbox" id="fam-tog"> Show famous spots</label>
+   </div>
+   <div class="fb-foot"><span class="fcount" id="fcount"></span><button class="fclear" id="fclear" hidden>Clear all</button></div>`;
+  wireFacets();
+}
+function wireFacets(){
+  const host=document.getElementById('filters');
+  host.querySelectorAll('[data-zone]').forEach(b=>b.onclick=()=>{
+    const z='z:'+b.dataset.zone;
+    if(FILT.loc.has(z)) FILT.loc.delete(z); else { FILT.loc.add(z); const box=ZONEBOX[b.dataset.zone]; if(box&&MAP) MAP.fitBounds(box,{padding:[24,24],animate:false}); }
+    applyFilters();
+  });
+  host.querySelectorAll('[data-cont]').forEach(b=>b.onclick=()=>{
+    const k='k:'+b.dataset.cont;
+    if(FILT.loc.has(k)) FILT.loc.delete(k);
+    else { FILT.loc.add(k); const box=CONTBOX[b.dataset.cont]; if(box&&MAP) MAP.fitBounds(box,{padding:[24,24],animate:false}); }
+    applyFilters();
+  });
+  const cbtn=host.querySelector('#cty-btn'), cmenu=host.querySelector('#cty-menu');
+  cbtn.onclick=e=>{e.stopPropagation(); cmenu.hidden=!cmenu.hidden;
+    if(!cmenu.hidden){const s=host.querySelector('#cty-search'); if(s) s.focus();}};
+  const csearch=host.querySelector('#cty-search');
+  if(csearch) csearch.oninput=()=>{
+    const v=csearch.value.trim().toLowerCase();
+    host.querySelectorAll('#cty-list .fcc').forEach(el=>{
+      el.style.display=(!v||el.dataset.name.includes(v))?'':'none'; });
+    host.querySelectorAll('#cty-list .fdd-sec').forEach(sec=>{
+      let n=sec.nextElementSibling, any=false;
+      while(n&&!n.classList.contains('fdd-sec')){ if(n.style.display!=='none') any=true; n=n.nextElementSibling; }
+      sec.style.display=any?'':'none'; });
+  };
+  host.querySelectorAll('[data-country]').forEach(cb=>cb.onchange=()=>{
+    const k='c:'+cb.dataset.country; if(cb.checked) FILT.loc.add(k); else FILT.loc.delete(k); applyFilters();
+  });
+  host.querySelectorAll('#seg-safe button').forEach(b=>b.onclick=()=>{FILT.safety=b.dataset.safe; applyFilters();});
+  host.querySelectorAll('#seg-price button').forEach(b=>b.onclick=()=>{FILT.price=+b.dataset.price; applyFilters();});
+  host.querySelector('#fam-tog').onchange=e=>{FILT.famous=e.target.checked; applyFilters();};
+  host.querySelector('#fclear').onclick=clearFilters;
+}
+function applyFilters(){ renderMarkers(); updateRank(); syncFacetUI(); layoutRank(); }
+/* The filter bar wraps to a variable number of rows (collections + continents + country chips),
+   so the leaderboard's top is measured from it rather than hard-coded. */
+function layoutRank(){
+  const f=document.getElementById('filters'), r=document.getElementById('rank');
+  if(!f||!r||getComputedStyle(r).display==='none') return;
+  const b=f.getBoundingClientRect();
+  if(b.height>0) r.style.top=Math.round(b.bottom+12)+'px';
+}
+function syncFacetUI(){
+  const host=document.getElementById('filters'); if(!host) return;
+  host.querySelectorAll('[data-zone]').forEach(b=>b.classList.toggle('on',FILT.loc.has('z:'+b.dataset.zone)));
+  host.querySelectorAll('[data-cont]').forEach(b=>b.classList.toggle('on',FILT.loc.has('k:'+b.dataset.cont)));
+  host.querySelectorAll('#seg-safe button').forEach(b=>b.classList.toggle('on',b.dataset.safe===FILT.safety));
+  host.querySelectorAll('#seg-price button').forEach(b=>b.classList.toggle('on',+b.dataset.price===FILT.price));
+  host.querySelectorAll('[data-country]').forEach(cb=>cb.checked=FILT.loc.has('c:'+cb.dataset.country));
+  const chips=host.querySelector('#cty-chips');
+  const cts=[...FILT.loc].filter(x=>x[0]==='c').map(x=>x.slice(2));
+  if(chips){ chips.innerHTML=cts.map(c=>`<span class="cchip" data-country="${esc(c)}">${esc(c)}<b>✕</b></span>`).join('');
+    chips.querySelectorAll('.cchip').forEach(el=>el.onclick=()=>{FILT.loc.delete('c:'+el.dataset.country); applyFilters();}); }
+  const n=PLACES.filter(matches).length;
+  const active=!!(FILT.q||FILT.loc.size||FILT.safety!=='all'||FILT.price<4||FILT.famous);
+  const cnt=host.querySelector('#fcount'); if(cnt) cnt.innerHTML=`<b>${n}</b> place${n!==1?'s':''}${active?' match':' on the map'}`;
+  const cl=host.querySelector('#fclear'); if(cl) cl.hidden=!active;
+  const badge=document.getElementById('filt-count');
+  if(badge){ const c=FILT.loc.size+(FILT.safety!=='all'?1:0)+(FILT.price<4?1:0)+(FILT.famous?1:0)+(FILT.q?1:0);
+    badge.textContent=c||''; badge.hidden=!c; }
+}
+function clearFilters(){
+  FILT.q=''; FILT.loc.clear(); FILT.safety='all'; FILT.price=4; FILT.famous=false;
+  const s=document.getElementById('search'); if(s) s.value='';
+  const ft=document.getElementById('fam-tog'); if(ft) ft.checked=false;
+  const res=document.getElementById('results'); if(res) res.hidden=true;
+  applyFilters();
 }
 
 /* ---------------- MAP (Leaflet + clustering — worker-free, robust everywhere) ---------------- */
 let CLUSTER=null, MARKERS={};
 function initMap(){
   // Opens centered on the Mediterranean (the current focus); all other places remain — just zoom out.
-  MAP=L.map('map',{worldCopyJump:true,minZoom:2,maxZoom:18,zoomControl:false,center:[38.5,14.5],zoom:5,preferCanvas:true});
+  MAP=L.map('map',{worldCopyJump:true,minZoom:2,maxZoom:18,zoomControl:false,center:WORLDVIEW.center,zoom:WORLDVIEW.zoom,preferCanvas:true});
   L.control.zoom({position:'bottomright'}).addTo(MAP);
   // Real satellite imagery — accurate to the actual landscape, more detail as you zoom in.
   L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -78,10 +252,12 @@ function initMap(){
   // Soft place-name + boundary labels layered over the imagery.
   L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
     {maxZoom:19,maxNativeZoom:19,opacity:.85}).addTo(MAP);
-  CLUSTER=L.markerClusterGroup({chunkedLoading:true,maxClusterRadius:50,showCoverageOnHover:false,
+  CLUSTER=L.markerClusterGroup({chunkedLoading:true,maxClusterRadius:50,showCoverageOnHover:false,zoomToBoundsOnClick:false,
     iconCreateFunction:c=>{const n=c.getChildCount();const s=n<10?34:n<50?42:n<200?52:62;
       return L.divIcon({html:`<div class="cl">${n}</div>`,className:'cluster-ic',iconSize:[s,s]});}});
   MAP.addLayer(CLUSTER);
+  // The plugin's own zoomToBounds() uses animated moves (which silently no-op here), so drive it ourselves.
+  CLUSTER.on('clusterclick',e=>{ MAP.fitBounds(e.layer.getBounds(),{padding:[40,40],animate:false}); });
   renderMarkers();
   MAP.on('moveend',updateRank);
   MAP.on('zoomend',onZoomTown);
@@ -91,9 +267,9 @@ function initMap(){
 function renderMarkers(){
   if(!CLUSTER) return;
   CLUSTER.clearLayers(); MARKERS={};
-  const pts=PLACES.filter(p=>p.pinned&&(FILT.cont==='all'||p.continent===FILT.cont));
+  const pts=PLACES.filter(matches);
   const ms=pts.map(p=>{
-    const m=L.circleMarker([p.lat,p.lng],{radius:6,fillColor:CC[p.continent]||CC.Other,fillOpacity:.95,
+    const m=L.circleMarker([p.lat,p.lng],{radius:6,fillColor:markerCol(p),fillOpacity:.95,
       color:'#0b0f16',weight:1.5});
     m.bindTooltip(p.name,{direction:'top',offset:[0,-4]});
     m.on('click',()=>openPlace(p.id));
@@ -101,22 +277,12 @@ function renderMarkers(){
   });
   CLUSTER.addLayers(ms);
 }
-const LBOX={'Europe':[[34,-11],[60,30]],'Asia':[[5,40],[55,145]],'Africa':[[-35,-18],[38,52]],
-  'North America':[[10,-125],[50,-66]],'South America':[[-55,-82],[12,-34]],'Oceania':[[-48,110],[-8,180]]};
-function setCont(c){FILT.cont=c;
-  document.querySelectorAll('#filters button').forEach(b=>b.classList.toggle('on',b.dataset.cont===c));
-  renderMarkers();
-  const box=LBOX[c];
-  if(box) MAP.fitBounds(box,{padding:[40,40]}); else MAP.setView([28,6],2);
-  updateRank();
-}
-
 /* ---------------- RANKING LEADERBOARD (top places in current view) ---------------- */
 const rankScore=p=>(p.sources?p.sources.filter(s=>s.url).length:0);
 function updateRank(){
   const host=document.getElementById('rank'); if(!host||!MAP) return;
   let b; try{ b=MAP.getBounds(); }catch(e){ return; }
-  const inview=PLACES.filter(p=>p.pinned && (FILT.cont==='all'||p.continent===FILT.cont) && b.contains([p.lat,p.lng]));
+  const inview=PLACES.filter(p=>matches(p) && b.contains([p.lat,p.lng]));
   inview.sort((a,z)=> rankScore(z)-rankScore(a) || (z.photos?z.photos.length:0)-(a.photos?a.photos.length:0) || a.name.localeCompare(z.name));
   const top=inview.slice(0,40);
   const max=top.length?Math.max(1,rankScore(top[0])):1;
@@ -130,11 +296,16 @@ function updateRank(){
         <div class="rk-bar"><span style="width:${w}%"></span></div>
       </div></button>`;
   }).join('');
+  const totalMatch=PLACES.filter(matches).length;
+  const emptyMsg = totalMatch===0
+    ? `<div class="rank-empty">No places match these filters.<br><button class="rank-clear" id="rank-clear">Clear all filters</button></div>`
+    : `<div class="rank-empty">Nothing in this view — pan or zoom to your ${totalMatch} match${totalMatch!==1?'es':''}.</div>`;
   host.innerHTML=`<div class="rank-head">
       <div class="rank-title"><span class="rk-live"></span>Top in view</div>
       <div class="rank-sub">${inview.length.toLocaleString()} place${inview.length!==1?'s':''} here · ranked by how often Ryan features them</div>
     </div>
-    <div class="rank-list">${rows||'<div class="rank-empty">No places in view — zoom out or pan to Ryan’s spots.</div>'}</div>`;
+    <div class="rank-list">${rows||emptyMsg}</div>`;
+  const rc=host.querySelector('#rank-clear'); if(rc) rc.onclick=clearFilters;
   host.querySelectorAll('.rk-row').forEach(el=>{
     el.onclick=()=>openPlace(el.dataset.id);
     el.onmouseenter=()=>{const m=MARKERS[el.dataset.id]; if(m&&m.setStyle) m.setStyle({radius:9,weight:3});};
@@ -194,21 +365,35 @@ function onZoomTown(){
 /* ---------------- SEARCH ---------------- */
 function wireUI(){
   const s=document.getElementById('search'), res=document.getElementById('results'), hub=document.getElementById('hub');
-  s.oninput=()=>{const v=s.value.trim().toLowerCase(); if(!v){res.hidden=true;return;}
-    const hits=PLACES.filter(p=>p.name.toLowerCase().includes(v)||(p.country||'').toLowerCase().includes(v))
-      .sort((a,b)=>(b.pinned-a.pinned)||b.sources.length-a.sources.length).slice(0,40);
+  // The "Maps" hub points at the owner's other LOCAL servers — dead links (and a layout leak) on a public deploy.
+  const isLocal=location.protocol==='file:'||/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  const hubBtn=document.getElementById('hub-btn');
+  if(!isLocal){ if(hubBtn) hubBtn.remove(); if(hub) hub.remove(); }
+  s.oninput=()=>{
+    const v=s.value.trim().toLowerCase(); FILT.q=v; applyFilters();   // search IS a live filter
+    if(!v){res.hidden=true;return;}
+    const hits=PLACES.filter(matches).sort((a,b)=>rankScore(b)-rankScore(a)).slice(0,30);
     res.innerHTML=hits.length?hits.map(p=>`<div class="r" data-id="${esc(p.id)}">
-        <div><div class="r-name">${esc(p.name)}</div><div class="r-sub">${esc(p.country)}${p.pinned?'':' · not mapped'}</div></div></div>`).join('')
-      :'<div class="r-none">No matches.</div>';
+        <div><div class="r-name">${esc(p.name)}</div>
+        <div class="r-sub">${p.advisory?`<span class="r-safe" style="background:${advColor(p.advisory.level)}"></span>`:''}${esc(p.country)} · ${esc(ZONELAB[p.zone]||p.continent||'')}</div></div></div>`).join('')
+      :'<div class="r-none">No matches in the curated set.</div>';
     res.hidden=false;
-    res.querySelectorAll('.r').forEach(el=>el.onclick=()=>{res.hidden=true;s.value='';openPlace(el.dataset.id);});
+    res.querySelectorAll('.r').forEach(el=>el.onclick=()=>{res.hidden=true; openPlace(el.dataset.id);});
   };
-  document.getElementById('hub-btn').onclick=()=>{hub.hidden=!hub.hidden;};
+  if(hubBtn&&hub) hubBtn.onclick=()=>{hub.hidden=!hub.hidden;};
+  const ft=document.getElementById('filt-toggle');
+  if(ft) ft.onclick=()=>document.getElementById('filters').classList.toggle('open');
   document.addEventListener('click',e=>{
-    if(!hub.contains(e.target)&&e.target.id!=='hub-btn') hub.hidden=true;
+    if(hub&&hub.isConnected&&!hub.contains(e.target)&&e.target.id!=='hub-btn') hub.hidden=true;
     if(!res.contains(e.target)&&e.target!==s) res.hidden=true;
+    const cm=document.getElementById('cty-menu'), cb=document.getElementById('cty-btn');
+    if(cm&&!cm.hidden&&!cm.contains(e.target)&&cb&&!cb.contains(e.target)) cm.hidden=true;
   });
-  document.addEventListener('keydown',e=>{if(e.key==='Escape'){closePanel();hub.hidden=true;res.hidden=true;if(LB)LB.dataset.on='';}});
+  document.addEventListener('keydown',e=>{ if(e.key!=='Escape') return;
+    if(LB&&LB.dataset.on==='1'){LB.dataset.on='';return;}       // lightbox first
+    if(!res.hidden){res.hidden=true;return;}
+    if(hub&&!hub.hidden){hub.hidden=true;return;}
+    closePanel(); });
 }
 
 /* ---------------- CURATED HOTELS ---------------- */
@@ -231,8 +416,10 @@ function stayCardHTML(h,p){
 /* ---------------- PLACE PANEL ---------------- */
 function openPlace(id){
   const p=BYID[id]; if(!p) return;
+  if(townFor&&townFor!==id) clearTown();       // stale hotel/sight pins from a previous town
+  clearTimeout(panelTimer);                    // don't let a pending close blank the new panel
   lastPlace=p;
-  if(p.pinned&&MAP) MAP.setView([p.lat,p.lng],Math.max(MAP.getZoom(),6),{animate:true});
+  if(p.pinned&&MAP) MAP.setView([p.lat,p.lng],Math.max(MAP.getZoom(),6),{animate:false});
   const photos=p.photos||[];
   const hero=photos[0];
   const thumbs=photos.length>1?`<div class="p-thumbs">${photos.map((im,i)=>`<img src="${esc(im.url)}" data-i="${i}" alt="${esc(im.alt||'')}" loading="lazy">`).join('')}</div>`:'';
@@ -247,6 +434,7 @@ function openPlace(id){
       ${p.safetyIndex!=null?`<span class="safety-idx" title="safety index — higher is safer">${p.safetyIndex}<small>/100</small></span>`:''}
     </div>
     ${p.safetySummary?`<p class="safety-sum">${esc(p.safetySummary)}</p>`:''}
+    ${safetyDetailHTML(p.safetyDetail)}
     <div class="src-note">US State Dept advisory for ${esc(p.country)}</div></div>` : '';
   const priceHTML = (p.dailyMidUSD||p.flightRT) ? `<div class="p-sec"><h4>Typical prices</h4>
     <div class="price-grid">
@@ -255,6 +443,7 @@ function openPlace(id){
       <div class="pc"><div class="pc-lab">Flight from Boston</div><div class="pc-val">${p.flightRT?usd(p.flightRT[0])+'–'+usd(p.flightRT[1]):'—'}</div><div class="pc-sub">round-trip${p.airport&&p.airport.city?' · '+esc(p.airport.city):''}</div></div>
       <div class="pc"><div class="pc-lab">Cost level</div><div class="pc-val cost-tier">${costTierHTML(p.costTier)}</div><div class="pc-sub">${p.flightNote?esc(p.flightNote):'vs. other countries'}</div></div>
     </div>
+    ${costDetailHTML(p.costDetail)}
     <a class="btn-flight" href="${flightUrl(p)}" target="_blank" rel="noopener">✈ Search flights: Boston → ${esc((p.airport&&p.airport.city)||p.country)} ↗</a>
     <div class="src-note">Typical/approx — use the booking &amp; flight links for exact live prices for your dates.</div></div>` : '';
   const highlights=(p.highlights||[]).length?`<div class="p-sec"><h4>Cool spots here (per Ryan)</h4><div class="chips">${p.highlights.map(h=>`<span class="chip">${esc(h)}</span>`).join('')}</div></div>`:'';
@@ -278,6 +467,7 @@ function openPlace(id){
       ${hero?`<img src="${esc(hero.url)}" alt="${esc(p.name)}" onload="this.classList.add('on')" onerror="this.remove()">`:''}
       <div class="p-grad"></div>
       <button class="p-x" aria-label="Close">✕</button>
+      ${photos.length>1?`<button class="p-nphoto" id="p-gallery">📸 ${photos.length} photos</button>`:''}
       <div class="p-cap">${p.kind?`<span class="p-kind">${esc(p.kind)}</span>`:''}
         <div class="p-name">${esc(p.name)}</div>
         <div class="p-loc">📍 ${esc([p.region,p.country].filter(Boolean).join(', '))}</div></div>
@@ -311,11 +501,13 @@ function openPlace(id){
   const tb=panel.querySelector('#town-btn'); if(tb) tb.onclick=()=>{ closePanel(); loadTown(p,true); };
   panel.querySelectorAll('.p-thumbs img').forEach(el=>el.onclick=()=>lightbox(photos,+el.dataset.i));
   if(hero) panel.querySelector('.p-hero img')?.addEventListener('click',()=>lightbox(photos,0));
+  panel.querySelector('#p-gallery')?.addEventListener('click',()=>lightbox(photos,0));
   panel.querySelectorAll('.near button').forEach(el=>el.onclick=()=>openPlace(el.dataset.id));
   renderWx(p);
 }
 function tsec(t){const a=(t||'').split(':').map(Number);return a.length===2?a[0]*60+a[1]:(a.length===3?a[0]*3600+a[1]*60+a[2]:0);}
-function closePanel(){const p=document.getElementById('panel');p.classList.remove('show');setTimeout(()=>{p.hidden=true;},320);}
+let panelTimer=null;
+function closePanel(){const p=document.getElementById('panel');p.classList.remove('show');clearTimeout(panelTimer);panelTimer=setTimeout(()=>{p.hidden=true;},320);}
 function nearbyHTML(p){
   const others=PLACES.filter(x=>x.country===p.country&&x.id!==p.id&&x.pinned).slice(0,8);
   if(!others.length) return '';
@@ -338,13 +530,24 @@ function renderWx(p){
   }).catch(()=>{const h=document.getElementById('wx');if(h)h.innerHTML='<div class="wx-load">Live weather unavailable right now.</div>';});
 }
 
-/* ---------------- LIGHTBOX ---------------- */
+/* ---------------- LIGHTBOX (gallery: prev/next + keyboard + counter) ---------------- */
+let LBP=[], LBI=0;
+function lbShow(){ if(!LB) return; const p=LBP[LBI]; if(!p) return;
+  LB.querySelector('img').src=p.url;
+  LB.querySelector('.lb-cap').innerHTML=`${esc(p.credit||'')} <span class="lb-n">${LBI+1} / ${LBP.length}</span>`; }
+function lbNav(d){ if(!LBP.length) return; LBI=(LBI+d+LBP.length)%LBP.length; lbShow(); }
 function lightbox(photos,i){
   photos=(photos||[]).filter(x=>x&&x.url); if(!photos.length) return;
+  LBP=photos; LBI=i||0;
   if(!LB){LB=document.createElement('div');LB.className='lb';
-    LB.innerHTML='<button class="x">✕</button><img alt="">';document.body.appendChild(LB);
+    LB.innerHTML='<button class="x" aria-label="Close">✕</button><button class="lb-prev" aria-label="Previous">‹</button><img alt=""><button class="lb-next" aria-label="Next">›</button><div class="lb-cap"></div>';
+    document.body.appendChild(LB);
     LB.querySelector('.x').onclick=()=>LB.dataset.on='';
-    LB.addEventListener('click',e=>{if(e.target===LB)LB.dataset.on='';});}
-  LB.querySelector('img').src=photos[i].url; LB.dataset.on='1';
+    LB.querySelector('.lb-prev').onclick=e=>{e.stopPropagation();lbNav(-1);};
+    LB.querySelector('.lb-next').onclick=e=>{e.stopPropagation();lbNav(1);};
+    LB.addEventListener('click',e=>{if(e.target===LB)LB.dataset.on='';});
+    document.addEventListener('keydown',e=>{ if(!LB||LB.dataset.on!=='1') return;
+      if(e.key==='ArrowLeft') lbNav(-1); else if(e.key==='ArrowRight') lbNav(1); });}
+  lbShow(); LB.dataset.on='1';
 }
 boot();
